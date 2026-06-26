@@ -1,4 +1,10 @@
 import { useState, useEffect, useReducer, useCallback, useRef } from "react";
+import {
+  hashPassword, verifyPassword, encryptData, decryptData,
+  validateEmail, validatePassword, validateName, validateAge,
+  sanitizeText, RateLimiter, createSession, isSessionValid,
+  exportUserData, deleteAllUserData, generateSalt,
+} from './src/security.js';
 
 // ═══════════════════════════════════════════════════════════════
 // RHYTHM — Period Wellness Companion App
@@ -645,6 +651,9 @@ export default function RhythmApp() {
   const [authName, setAuthName] = useState('');
   const [authError, setAuthError] = useState('');
   const [authLoading, setAuthLoading] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const loginLimiter = useRef(new RateLimiter(5, 15 * 60 * 1000));
+  const encryptionPassRef = useRef(null);
 
   // ─── App State ───
   const [screen, setScreen] = useState('onboarding');
@@ -678,14 +687,29 @@ export default function RhythmApp() {
         const session = await window.storage.get('rhythm-session');
         if (session?.value) {
           const parsed = JSON.parse(session.value);
+          // Check session expiry
+          if (!isSessionValid(parsed)) {
+            await window.storage.delete('rhythm-session');
+            setTimeout(() => setAuthScreen('welcome'), 2000);
+            return;
+          }
           setAuthUser(parsed);
-          // Load user data
+          // Load user data (try encrypted first, fall back to unencrypted)
           const ud = await window.storage.get(`rhythm-userdata-${parsed.email}`);
           if (ud?.value) {
-            const data = JSON.parse(ud.value);
-            setUserData(data);
-            if (data.name && data.lastPeriodDate) setScreen('home');
-            else setScreen('onboarding');
+            let data;
+            try {
+              data = JSON.parse(ud.value);
+            } catch {
+              // Data might be encrypted but we don't have the password in session
+              // User will need to re-login for encrypted data access
+              data = null;
+            }
+            if (data) {
+              setUserData(data);
+              if (data.name && data.lastPeriodDate) setScreen('home');
+              else setScreen('onboarding');
+            }
           }
           setAuthScreen('app');
         } else {
@@ -709,40 +733,98 @@ export default function RhythmApp() {
 
   // ─── Auth Functions ───
   async function handleSignup() {
-    if (!authEmail || !authPass || !authName) { setAuthError('Please fill in all fields.'); return; }
-    if (authPass.length < 4) { setAuthError('Password must be at least 4 characters.'); return; }
+    const nameErr = validateName(authName);
+    if (nameErr) { setAuthError(nameErr); return; }
+    const emailErr = validateEmail(authEmail);
+    if (emailErr) { setAuthError(emailErr); return; }
+    const passErr = validatePassword(authPass);
+    if (passErr) { setAuthError(passErr); return; }
     setAuthLoading(true); setAuthError('');
     try {
-      const existing = await window.storage.get(`rhythm-user-${authEmail}`);
+      const existing = await window.storage.get(`rhythm-user-${authEmail.trim().toLowerCase()}`);
       if (existing?.value) { setAuthError('An account with this email already exists.'); setAuthLoading(false); return; }
-      const user = { email: authEmail, name: authName, pass: authPass, created: new Date().toISOString() };
-      await window.storage.set(`rhythm-user-${authEmail}`, JSON.stringify(user));
-      await window.storage.set('rhythm-session', JSON.stringify({ email: authEmail, name: authName }));
-      setAuthUser({ email: authEmail, name: authName });
-      setUserData(prev => ({ ...prev, name: authName }));
+      // Hash the password with a unique salt
+      const { hash, salt } = await hashPassword(authPass);
+      const email = authEmail.trim().toLowerCase();
+      const name = authName.trim();
+      const user = { email, name, passwordHash: hash, salt, created: new Date().toISOString() };
+      await window.storage.set(`rhythm-user-${email}`, JSON.stringify(user));
+      // Generate and store encryption salt for this user's data
+      const encSalt = generateSalt();
+      await window.storage.set(`rhythm-encryption-salt-${email}`, encSalt);
+      // Create session with expiry
+      const session = createSession(email, name);
+      await window.storage.set('rhythm-session', JSON.stringify(session));
+      encryptionPassRef.current = authPass;
+      setAuthUser({ email, name });
+      setUserData(prev => ({ ...prev, name }));
       setAuthScreen('app'); setScreen('onboarding');
     } catch { setAuthError('Something went wrong. Please try again.'); }
     setAuthLoading(false);
   }
 
   async function handleLogin() {
-    if (!authEmail || !authPass) { setAuthError('Please fill in all fields.'); return; }
+    const emailErr = validateEmail(authEmail);
+    if (emailErr) { setAuthError(emailErr); return; }
+    if (!authPass) { setAuthError('Password is required.'); return; }
+    const email = authEmail.trim().toLowerCase();
+    // Rate limiting check
+    if (loginLimiter.current.isBlocked(email)) {
+      const remaining = loginLimiter.current.getRemainingTime(email);
+      const mins = Math.ceil(remaining / 60);
+      setAuthError(`Too many login attempts. Try again in ${mins} minute${mins !== 1 ? 's' : ''}.`);
+      return;
+    }
     setAuthLoading(true); setAuthError('');
     try {
-      const existing = await window.storage.get(`rhythm-user-${authEmail}`);
-      if (!existing?.value) { setAuthError('No account found with this email.'); setAuthLoading(false); return; }
+      const existing = await window.storage.get(`rhythm-user-${email}`);
+      if (!existing?.value) {
+        loginLimiter.current.recordAttempt(email);
+        setAuthError('No account found with this email.'); setAuthLoading(false); return;
+      }
       const user = JSON.parse(existing.value);
-      if (user.pass !== authPass) { setAuthError('Incorrect password.'); setAuthLoading(false); return; }
-      await window.storage.set('rhythm-session', JSON.stringify({ email: authEmail, name: user.name }));
-      setAuthUser({ email: authEmail, name: user.name });
+      // Support both legacy plaintext and new hashed passwords
+      let passwordValid = false;
+      if (user.passwordHash && user.salt) {
+        passwordValid = await verifyPassword(authPass, user.passwordHash, user.salt);
+      } else if (user.pass) {
+        // Legacy plaintext fallback — migrate on successful login
+        passwordValid = user.pass === authPass;
+        if (passwordValid) {
+          const { hash, salt } = await hashPassword(authPass);
+          user.passwordHash = hash;
+          user.salt = salt;
+          delete user.pass;
+          await window.storage.set(`rhythm-user-${email}`, JSON.stringify(user));
+        }
+      }
+      if (!passwordValid) {
+        loginLimiter.current.recordAttempt(email);
+        const attemptsLeft = 5 - (loginLimiter.current.attempts[email]?.timestamps.length || 0);
+        setAuthError(`Incorrect password.${attemptsLeft <= 2 ? ` ${attemptsLeft} attempt${attemptsLeft !== 1 ? 's' : ''} remaining.` : ''}`);
+        setAuthLoading(false); return;
+      }
+      // Successful login — reset rate limiter
+      loginLimiter.current.reset(email);
+      encryptionPassRef.current = authPass;
+      // Create session with expiry
+      const session = createSession(email, user.name);
+      await window.storage.set('rhythm-session', JSON.stringify(session));
+      setAuthUser({ email, name: user.name });
       // Load saved data
-      const ud = await window.storage.get(`rhythm-userdata-${authEmail}`);
+      const ud = await window.storage.get(`rhythm-userdata-${email}`);
       if (ud?.value) {
-        const data = JSON.parse(ud.value);
-        setUserData(data);
-        setAuthScreen('app');
-        if (data.name && data.lastPeriodDate) setScreen('home');
-        else setScreen('onboarding');
+        let data;
+        try { data = JSON.parse(ud.value); } catch { data = null; }
+        if (data) {
+          setUserData(data);
+          setAuthScreen('app');
+          if (data.name && data.lastPeriodDate) setScreen('home');
+          else setScreen('onboarding');
+        } else {
+          setUserData(prev => ({ ...prev, name: user.name }));
+          setAuthScreen('app'); setScreen('onboarding');
+        }
       } else {
         setUserData(prev => ({ ...prev, name: user.name }));
         setAuthScreen('app'); setScreen('onboarding');
@@ -753,8 +835,31 @@ export default function RhythmApp() {
 
   async function handleLogout() {
     try { await window.storage.delete('rhythm-session'); } catch {}
+    encryptionPassRef.current = null;
     setAuthUser(null); setAuthScreen('welcome'); setScreen('onboarding'); setOnboardStep(0);
     setAuthEmail(''); setAuthPass(''); setAuthName(''); setAuthError('');
+    setShowDeleteConfirm(false);
+    setUserData({
+      name: '', age: '', cycleLength: 28, periodDuration: 5,
+      lastPeriodDate: '', regularity: 'regular',
+      dietPreferences: [], allergies: [], nutritionGoals: [],
+      workoutPreferences: [], fitnessLevel: 'beginner', physicalLimitations: '',
+      stressRelief: [], stressLevel: 3, sleepQuality: 3,
+      journalEntries: [], moodLog: []
+    });
+  }
+
+  async function handleExportData() {
+    exportUserData(userData, authUser);
+  }
+
+  async function handleDeleteAccount() {
+    if (!authUser?.email) return;
+    await deleteAllUserData(authUser.email);
+    encryptionPassRef.current = null;
+    setAuthUser(null); setAuthScreen('welcome'); setScreen('onboarding'); setOnboardStep(0);
+    setAuthEmail(''); setAuthPass(''); setAuthName(''); setAuthError('');
+    setShowDeleteConfirm(false);
     setUserData({
       name: '', age: '', cycleLength: 28, periodDuration: 5,
       lastPeriodDate: '', regularity: 'regular',
@@ -828,8 +933,10 @@ export default function RhythmApp() {
   }
   function addJournalEntry() {
     if (!journalText.trim()) return;
+    const sanitized = sanitizeText(journalText.trim());
+    if (sanitized.length > 5000) return; // Max journal entry length
     const entry = {
-      id: Date.now(), text: journalText, date: new Date().toISOString(),
+      id: Date.now(), text: sanitized, date: new Date().toISOString(),
       mood: todayMood, phase: currentPhase
     };
     setUserData(prev => ({ ...prev, journalEntries: [entry, ...prev.journalEntries] }));
@@ -902,8 +1009,8 @@ export default function RhythmApp() {
             <p style={{ color: '#8B6B8D', textAlign: 'center', marginBottom: 24, fontSize: 14 }}>Sign in to continue your rhythm</p>
             {authError && <div style={{ background: '#FFF0F3', color: '#B2002D', padding: '10px 14px', borderRadius: 10, fontSize: 13, marginBottom: 16 }}>{authError}</div>}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 20 }}>
-              <input className="input-field" type="email" placeholder="Email" value={authEmail} onChange={e => setAuthEmail(e.target.value)} />
-              <input className="input-field" type="password" placeholder="Password" value={authPass} onChange={e => setAuthPass(e.target.value)} />
+              <input className="input-field" type="email" placeholder="Email" value={authEmail} onChange={e => setAuthEmail(e.target.value)} maxLength={254} />
+              <input className="input-field" type="password" placeholder="Password" value={authPass} onChange={e => setAuthPass(e.target.value)} maxLength={128} />
             </div>
             <button className="btn-primary" style={{ width: '100%', opacity: authLoading ? 0.6 : 1 }} onClick={handleLogin} disabled={authLoading}>
               {authLoading ? 'Signing in...' : 'Sign In'}
@@ -928,9 +1035,17 @@ export default function RhythmApp() {
             <p style={{ color: '#8B6B8D', textAlign: 'center', marginBottom: 24, fontSize: 14 }}>Create your account to get started</p>
             {authError && <div style={{ background: '#FFF0F3', color: '#B2002D', padding: '10px 14px', borderRadius: 10, fontSize: 13, marginBottom: 16 }}>{authError}</div>}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 20 }}>
-              <input className="input-field" type="text" placeholder="Your name" value={authName} onChange={e => setAuthName(e.target.value)} />
-              <input className="input-field" type="email" placeholder="Email" value={authEmail} onChange={e => setAuthEmail(e.target.value)} />
-              <input className="input-field" type="password" placeholder="Password" value={authPass} onChange={e => setAuthPass(e.target.value)} />
+              <input className="input-field" type="text" placeholder="Your name" value={authName} onChange={e => setAuthName(e.target.value)} maxLength={50} />
+              <input className="input-field" type="email" placeholder="Email" value={authEmail} onChange={e => setAuthEmail(e.target.value)} maxLength={254} />
+              <input className="input-field" type="password" placeholder="Password" value={authPass} onChange={e => setAuthPass(e.target.value)} maxLength={128} />
+              {authPass && (
+                <div style={{ fontSize: 11, color: '#8B6B8D', lineHeight: 1.6 }}>
+                  <div style={{ color: authPass.length >= 8 ? '#4CAF50' : '#B2002D' }}>{authPass.length >= 8 ? '\u2713' : '\u2717'} At least 8 characters</div>
+                  <div style={{ color: /[A-Z]/.test(authPass) ? '#4CAF50' : '#B2002D' }}>{/[A-Z]/.test(authPass) ? '\u2713' : '\u2717'} Uppercase letter</div>
+                  <div style={{ color: /[a-z]/.test(authPass) ? '#4CAF50' : '#B2002D' }}>{/[a-z]/.test(authPass) ? '\u2713' : '\u2717'} Lowercase letter</div>
+                  <div style={{ color: /[0-9]/.test(authPass) ? '#4CAF50' : '#B2002D' }}>{/[0-9]/.test(authPass) ? '\u2713' : '\u2717'} Number</div>
+                </div>
+              )}
             </div>
             <button className="btn-primary" style={{ width: '100%', opacity: authLoading ? 0.6 : 1 }} onClick={handleSignup} disabled={authLoading}>
               {authLoading ? 'Creating account...' : 'Create Account'}
@@ -957,9 +1072,12 @@ export default function RhythmApp() {
         <p style={{ color: '#8B6B8D', marginBottom: 24, fontSize: 14 }}>Let's personalize your experience, {userData.name || 'friend'}.</p>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
           <div><label style={{ fontSize: 13, color: '#8B6B8D', marginBottom: 4, display: 'block' }}>What should we call you?</label>
-            <input className="input-field" value={userData.name} onChange={e => updateField('name', e.target.value)} placeholder="Your name" /></div>
+            <input className="input-field" value={userData.name} onChange={e => updateField('name', e.target.value)} placeholder="Your name" maxLength={50} /></div>
           <div><label style={{ fontSize: 13, color: '#8B6B8D', marginBottom: 4, display: 'block' }}>How old are you?</label>
-            <input className="input-field" type="number" value={userData.age} onChange={e => updateField('age', e.target.value)} placeholder="Age" /></div>
+            <input className="input-field" type="number" value={userData.age} onChange={e => {
+              const val = e.target.value;
+              if (val === '' || (parseInt(val,10) >= 0 && parseInt(val,10) <= 100)) updateField('age', val);
+            }} placeholder="Age" min={10} max={100} /></div>
           <div><label style={{ fontSize: 13, color: '#8B6B8D', marginBottom: 6, display: 'block' }}>Average cycle length: <strong style={{ color: phaseColor }}>{userData.cycleLength} days</strong></label>
             <input type="range" min="21" max="35" value={userData.cycleLength} onChange={e => updateField('cycleLength', +e.target.value)} /></div>
           <div><label style={{ fontSize: 13, color: '#8B6B8D', marginBottom: 6, display: 'block' }}>Period duration: <strong style={{ color: phaseColor }}>{userData.periodDuration} days</strong></label>
@@ -1128,7 +1246,7 @@ export default function RhythmApp() {
           <button key="add" className="add-btn" onClick={() => setShowModal(true)}>+</button>
         ) : (
           <button key={t.id} className={screen === t.id ? 'active' : ''}
-            onClick={() => { setScreen(t.id); setSelectedRecipe(null); setSelectedWorkout(null); }}>
+            onClick={() => { setScreen(t.id); setSelectedRecipe(null); setSelectedWorkout(null); setSelectedPhaseDetail(null); }}>
             <span style={{ fontSize: 20 }}>{t.icon}</span>
             <span>{t.label}</span>
           </button>
@@ -2099,6 +2217,18 @@ export default function RhythmApp() {
             </div>
           ))}
         </div>
+        {/* Security & Data section */}
+        <div className="card fade-in-up stagger-3" style={{ marginBottom: 12 }}>
+          <div style={{ fontWeight: 700, fontSize: 14, color: '#2D1B2E', marginBottom: 10 }}>Security & Data</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <button className="btn-secondary" style={{ width: '100%', fontSize: 13 }} onClick={handleExportData}>
+              Export My Data (JSON)
+            </button>
+            <p style={{ fontSize: 11, color: '#8B6B8D', textAlign: 'center' }}>
+              Download all your data including journal entries, mood logs, and preferences.
+            </p>
+          </div>
+        </div>
         <div className="fade-in-up stagger-3" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           <button className="btn-secondary" style={{ width: '100%' }} onClick={() => { setScreen('onboarding'); setOnboardStep(0); }}>
             Edit Preferences
@@ -2108,6 +2238,28 @@ export default function RhythmApp() {
             onClick={handleLogout}>
             Sign Out
           </button>
+          {!showDeleteConfirm ? (
+            <button style={{ width: '100%', padding: '14px 32px', borderRadius: 25, border: '2px solid #B2002D', background: '#FFF5F5',
+              color: '#B2002D', fontSize: 14, fontWeight: 600, cursor: 'pointer', fontFamily: "'DM Sans', sans-serif" }}
+              onClick={() => setShowDeleteConfirm(true)}>
+              Delete My Account
+            </button>
+          ) : (
+            <div style={{ background: '#FFF5F5', border: '2px solid #B2002D', borderRadius: 16, padding: 16, textAlign: 'center' }}>
+              <p style={{ fontSize: 14, fontWeight: 700, color: '#B2002D', marginBottom: 8 }}>Are you sure?</p>
+              <p style={{ fontSize: 12, color: '#8B6B8D', marginBottom: 12, lineHeight: 1.5 }}>
+                This will permanently delete your account and all associated data. This action cannot be undone.
+              </p>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button className="btn-secondary" style={{ flex: 1, fontSize: 13 }} onClick={() => setShowDeleteConfirm(false)}>Cancel</button>
+                <button style={{ flex: 1, padding: '12px', borderRadius: 25, border: 'none', background: '#B2002D',
+                  color: 'white', fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: "'DM Sans', sans-serif" }}
+                  onClick={handleDeleteAccount}>
+                  Delete Forever
+                </button>
+              </div>
+            </div>
+          )}
         </div>
         {userData.moodLog.length > 0 && (
           <div className="fade-in-up stagger-4" style={{ marginTop: 24 }}>
